@@ -1,125 +1,90 @@
+
 # pages/2_Upload_New.py
 import streamlit as st
 from auth import get_current_user
 from db import (
-    count_user_documents,
-    insert_document_record,
-    log_activity,
-    get_user_by_id
+    insert_document, log_activity, count_user_documents,
+    is_subscription_active, is_account_locked
 )
 from storage import save_uploaded_file, ALLOWED_EXTENSIONS
-from datetime import datetime
 
 FREE_LIMIT = 5
-
 CATEGORY_OPTIONS = [
-    "Identity",
-    "Banking & Finance",
-    "Property & Assets",
-    "Medical / Health",
-    "School / Certificates",
-    "Legal",
-    "Other"
+    "Identity", "Banking & Finance", "Property & Assets", "Medical / Health",
+    "School / Certificates", "Legal", "Other"
 ]
 
-def can_upload_more_docs(user, current_count):
-    """
-    Return (allowed: bool, message: str)
-    """
-    if user["is_premium"]:
-        return True, "Premium: unlimited."
-    else:
-        if current_count >= FREE_LIMIT:
-            return False, (
-		"You have reached your free limit of 5 documents. "
-                "Upgrade once for ₦50,000 or $35 to unlock unlimited lifetime storage."
-            )
-        else:
-            return True, f"You are on Free Plan. {current_count}/{FREE_LIMIT} used."
 def main():
     user = get_current_user()
     if not user:
-        st.error("Please go back and sign in.")
+        st.error("Please sign in to continue.")
         st.stop()
 
-    st.title("Upload New Document 📤")
-    st.caption("Add passports, CAC docs, insurance policies, employment letters, receipts, etc.")
+    # If the user once subscribed and is now expired → fully lock uploads
+    if is_account_locked(user):
+        st.error("Your subscription has expired. Uploads are disabled until admin approves renewal.")
+        st.info("Go to **Settings → Upgrade / Renewal** to submit your payment reference.")
+        st.stop()
 
-    # Check limits
-    current_count = count_user_documents(user["id"])
-    allowed, msg = can_upload_more_docs(user, current_count)
-    if user["is_premium"]:
-        st.success(msg)
+    st.title("📤 Upload a New Document")
+    st.caption("Store your important files securely in your Chumcred Vault.")
+
+    used = count_user_documents(user["id"])
+    active = is_subscription_active(user)
+    plan = (user.get("plan") or "FREE").upper()
+
+    if plan == "FREE":
+        st.info(f"Plan: Free — {used}/{FREE_LIMIT} used. You can upload up to {FREE_LIMIT} documents for free.")
+        if used >= FREE_LIMIT:
+            st.error("Free limit reached. Please subscribe to continue uploading.")
+            st.stop()
     else:
-        if allowed:
-            st.info(msg)
+        if active:
+            st.success("Plan: Annual — Unlimited uploads enabled.")
         else:
-            st.error(msg)
+            # (Shouldn’t reach here because is_account_locked() would have stopped; safe message anyway)
+            st.error("Your subscription is not active. Uploads are disabled.")
+            st.stop()
 
-    # Upload form
     with st.form("upload_form", clear_on_submit=True):
         uploaded_file = st.file_uploader(
             "Choose a file to upload",
             type=[ext.replace(".", "") for ext in ALLOWED_EXTENSIONS],
-            help="Supported: PDF, Word, Excel, PowerPoint, images, CSV, TXT"
+            help="Supported: PDF, Word, Excel, PowerPoint, images, CSV, TXT",
         )
         category = st.selectbox("Category", CATEGORY_OPTIONS, index=0)
         notes = st.text_area("Notes / Description (optional)")
-        expiry_date = st.date_input(
-            "Expiry / Renewal Date (optional)",
-            value=None,
-            help="Example: Passport expiry date, insurance renewal date"
-        )
+        expiry_date = st.date_input("Expiry / Renewal Date (optional)", value=None)
 
         submitted = st.form_submit_button("Save to Vault")
-
         if submitted:
-            if not allowed:
-                st.error("Upload blocked until you upgrade.")
-                st.stop()
-
             if uploaded_file is None:
                 st.warning("Please choose a file.")
                 st.stop()
 
-            # Save file to disk
             stored_path, size_kb, ext = save_uploaded_file(
                 user_id=user["id"],
-                uploaded_file=uploaded_file
+                uploaded_file=uploaded_file,
             )
 
-            # Store metadata in DB
             expiry_str = expiry_date.isoformat() if expiry_date else None
-
-            doc_id = insert_document_record(
+            doc_id = insert_document(
                 user_id=user["id"],
                 filename_original=uploaded_file.name,
                 stored_path=stored_path,
                 file_type=ext,
+                size_kb=size_kb,
                 category=category,
                 notes=notes,
                 expiry_date=expiry_str,
-                size_kb=size_kb,
-                is_generated=False
             )
 
-            # Log activity
-            log_activity(
-                user_id=user["id"],
-                action="upload",
-                document_id=doc_id,
-                details=f"Uploaded {uploaded_file.name}"
-            )
-
-            st.success("Document saved to your vault ✅")
+            log_activity(user_id=user["id"], action="upload", doc_id=doc_id,
+                         details=f"Uploaded {uploaded_file.name}")
+            st.success("✅ Document saved to your vault!")
 
     st.divider()
-    st.write("Security tips:")
-    st.write("- Only upload documents you personally own or are authorized to store.")
-    st.write("- Keep your login private.")
-    st.write("- Set expiry dates so you get visual reminders before critical documents expire.")
-
-    st.write("Powered by Chumcred Limited")
+    st.caption("Powered by Chumcred Limited")
 
 if __name__ == "__main__":
     main()

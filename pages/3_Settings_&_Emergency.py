@@ -1,34 +1,31 @@
+
 # pages/3_Settings_&_Emergency.py
-
-import sys
-import os
-import streamlit as st
-from auth import get_current_user
-
-# Fix import path so this page can import db.py when running as a subpage
+import sys, os
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+import streamlit as st
+from auth import get_current_user
 from db import (
     get_user_by_id,
     update_emergency_contact,
-    update_user_premium,
+    record_payment_submission,
+    update_payment_status,
 )
 
+ANNUAL_NGN = int(os.getenv("ANNUAL_PRICE_NGN", "35000"))
+ANNUAL_USD = float(os.getenv("ANNUAL_PRICE_USD", "20"))
 
 def refresh_session_user():
-    """
-    After we update something in the DB (like emergency contact or premium),
-    reload fresh user data from DB into st.session_state.user so UI is accurate.
-    """
     if "user" in st.session_state and st.session_state.user:
         uid = st.session_state.user["id"]
         latest = get_user_by_id(uid)
         if latest:
             st.session_state.user = latest
 
+# ... all the code above remains the same ...
 
 def main():
     user = get_current_user()
@@ -36,22 +33,19 @@ def main():
         st.error("Please sign in.")
         st.stop()
 
-    # sync session with DB on every render
     refresh_session_user()
     user = get_current_user()
 
     st.title("Settings & Emergency Contact ⚙️")
     st.caption("Manage account info, emergency contact, and premium upgrade status.")
 
-    # -------------------------
-    # ACCOUNT OVERVIEW
-    # -------------------------
+    # --- Account Overview ---
     st.subheader("Account Overview")
     st.write(f"Name: {user.get('full_name', '')}")
     st.write(f"Email: {user.get('email', '')}")
 
-    if user.get("is_premium"):
-        st.success("Plan: ✅ Premium Lifetime (Unlimited storage forever)")
+    if user.get("is_premium") or (user.get("plan") and user["plan"].upper() != "FREE"):
+        st.success("Plan: ✅ Annual / Active (Unlimited storage)")
     else:
         st.info("Plan: 🔓 Free (5 documents max until you upgrade)")
 
@@ -60,114 +54,63 @@ def main():
 
     st.divider()
 
-    # -------------------------
-    # EMERGENCY CONTACT
-    # -------------------------
+    # --- Emergency Contact ---
     st.subheader("Emergency Contact")
-    st.write(
-        "This is someone you trust who should at least know this vault exists "
-        "if anything happens to you."
-    )
-
-    emergency_name = st.text_input(
-        "Full Name of Contact",
-        value=user.get("emergency_name") or ""
-    )
-    emergency_email = st.text_input(
-        "Contact Email",
-        value=user.get("emergency_email") or ""
-    )
-    emergency_relation = st.text_input(
-        "Relationship",
-        value=user.get("emergency_relation") or ""
-    )
-
+    st.write("This is someone you trust who should at least know this vault exists if anything happens to you.")
+    emergency_name = st.text_input("Full Name of Contact", value=user.get("emergency_name") or "")
+    emergency_email = st.text_input("Contact Email", value=user.get("emergency_email") or "")
+    emergency_relation = st.text_input("Relationship", value=user.get("emergency_relation") or "")
     if st.button("Save Emergency Contact"):
-        update_emergency_contact(
-            user_id=user["id"],
-            name=emergency_name,
-            email=emergency_email,
-            relation=emergency_relation,
-        )
+        update_emergency_contact(user["id"], emergency_name, emergency_email, emergency_relation)
         refresh_session_user()
         st.success("Emergency contact saved.")
 
-    st.caption(
-        "Note: We do NOT automatically send them your documents. "
-        "This is only stored so someone you trust knows where your important files are."
-    )
-
     st.divider()
 
-    # -------------------------
-    # PAYMENT OPTIONS / UPGRADE
-    # -------------------------
-    st.subheader("Payment Options")
-    st.write("Choose how you want to upgrade:")
-
-    col_n, col_d = st.columns(2)
-
-    with col_n:
-        st.markdown("**Pay in Naira (₦50,000)**")
-        st.write("Supported: Debit card, bank transfer, USSD.")
-        st.write("Provider: Paystack / Flutterwave")
-        st.link_button("Pay ₦50,000 now", "https://paystack.com/your-payment-link-here")
-
-    with col_d:
-        st.markdown("**Pay in USD ($35)**")
-        st.write("Supported: Visa / Mastercard / USD cards.")
-        st.write("Provider: Stripe")
-        st.link_button("Pay $35 now", "https://checkout.stripe.com/your-checkout-link-here")
-
-    st.caption(
-        "These buttons will open secure payment soon. "
-        "For now you can simulate activation below."
+    # --- Upgrade / Renewal Section ---
+    st.subheader("Upgrade / Renewal (Admin Approval Required)")
+    st.info(
+        "Pay via **Paystack / Flutterwave / Stripe / Bank Transfer**, then submit your reference below. "
+        "**An admin will review and activate your account.**"
     )
 
-    st.divider()
-
-    # -------------------------
-    # PREMIUM UPGRADE CONTROL
-    # -------------------------
-    st.subheader("Upgrade to Premium Lifetime (₦50,000 or $35 one-time)")
-    st.write(
-        "Once you upgrade, you can store UNLIMITED documents forever. "
-        "No subscription. No renewal. Just a single lifetime activation."
-    )
-
-    if not user.get("is_premium"):
-        st.info(
-            "In production, you'll be able to pay online (card / bank transfer). "
-            "For now, click the button below to simulate payment of ₦50,000 / $35."
+    with st.expander("🏦 Pay by Bank Transfer (NGN)"):
+        st.markdown(
+            """
+            **Account Name:** Chumcred Limited  
+            **Bank:** Sterling Bank Plc  
+            **Account Number:** 0087611334                  
+            **Amount:** ₦35,000 (initial) / ₦25,000 (renewal)  
+            **Narration/Reference:** *your email + 'Chumcred Vault'*
+            """
         )
 
-        if st.button("Mark me as Premium (simulate payment)"):
-            # Record a simulated NGN 50,000 payment
-            update_user_premium(
-                user_id=user["id"],
-                amount=50000.00,
-                currency="NGN"
-            )
-            refresh_session_user()
-            st.success(
-                "You are now Premium for life 🎉. "
-                "Reload the page or go to Dashboard to see unlimited status."
-            )
-    else:
-        st.success("You are already Premium Lifetime ✅")
+    with st.form("submit_reference", clear_on_submit=True):
+        provider = st.selectbox("Provider", ["Paystack", "Flutterwave", "Stripe", "Bank Transfer"])
+        currency = st.selectbox("Currency", ["NGN", "USD"])
+        amount = st.number_input("Amount paid", min_value=0.0, step=1.0, value=0.0)
+        reference = st.text_input("Payment reference / narration")
+        submitted = st.form_submit_button("Submit reference for admin review")
+        if submitted:
+            if not reference or amount <= 0:
+                st.warning("Please enter a valid amount and reference.")
+            else:
+                from db import record_payment_submission, update_payment_status
+                record_payment_submission(user["id"], provider, currency, amount, reference)
+                update_payment_status(user["id"], "pending")
+                refresh_session_user()
+                st.success("Reference submitted. Admin will review and activate your account.")
 
-    st.divider()
-    st.subheader("Danger Zone")
-    st.write("This will permanently erase your vault and all stored documents. This cannot be undone.")
+    # --- Renewal Reminder ---
+    from db import needs_renewal_reminder, subscription_days_left
+    if needs_renewal_reminder(user):
+        st.warning(
+            f"Your subscription will expire in {max(subscription_days_left(user),0)} day(s). "
+            "Please renew to avoid lockout."
+        )
 
-if st.button("Delete my account and all documents", type="primary"):
-    from db import delete_user_and_data
-    delete_user_and_data(user["id"])
-    st.success("Your account and all documents have been deleted.")
-    st.warning("Please log out now.")
-
-
-    st.write("Powered by Chumcred Limited")
+    st.write("---")
+    st.caption("Powered by Chumcred Limited")
 
 
 if __name__ == "__main__":

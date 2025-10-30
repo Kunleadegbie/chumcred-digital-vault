@@ -1,405 +1,502 @@
+
 # db.py
+import os
 import sqlite3
+import datetime as dt
+from typing import Optional, Dict, Any, List, Tuple
 from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime
 
-DB_PATH = "vault.db"
+# ===================== Config =====================
+DB_PATH = os.getenv("VAULT_DB_PATH", os.path.join(os.path.dirname(__file__), "vault.db"))
+GRACE_DAYS = int(os.getenv("GRACE_DAYS", "0"))  # lock immediately after expiry
 
-def get_conn():
+# ===================== Connection =================
+def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
+# ============== Introspection helpers =============
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (name,))
+    return cur.fetchone() is not None
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table});")
+    cols = [r[1] for r in cur.fetchall()]
+    return column in cols
+
+def _users_columns() -> set:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(users);")
+    cols = {row[1] for row in cur.fetchall()}
+    conn.close()
+    return cols
+
+def _norm_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+# ============== Schema init & upgrades =============
 def init_db():
+    """Create base tables if missing; add new columns safely for older DBs."""
     conn = get_conn()
     cur = conn.cursor()
 
-    # Users table
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE NOT NULL,
-        hashed_password TEXT NOT NULL,
-        full_name TEXT,
-        is_premium BOOLEAN DEFAULT 0,
-        premium_activated_at TEXT,
-        premium_amount REAL,
-        emergency_name TEXT,
-        emergency_email TEXT,
-        emergency_relation TEXT,
-        is_admin BOOLEAN DEFAULT 0,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        last_login_at TEXT
-    );
-    """)
-
-    # Documents table
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS documents (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        filename_original TEXT NOT NULL,
-        stored_path TEXT NOT NULL,
-        file_type TEXT NOT NULL,
-        category TEXT,
-        notes TEXT,
-        expiry_date TEXT,
-        size_kb INTEGER,
-        uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        is_generated BOOLEAN DEFAULT 0,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    );
-    """)
-
-    # Activity log table
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS activity_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        action TEXT NOT NULL,
-        document_id INTEGER,
-        timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
-        details TEXT,
-        FOREIGN KEY(user_id) REFERENCES users(id),
-        FOREIGN KEY(document_id) REFERENCES documents(id)
-    );
-    """)
-
-    # Payments table
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        amount REAL NOT NULL,
-        currency TEXT NOT NULL,
-        provider TEXT,
-        reference_code TEXT UNIQUE,
-        paid_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    );
-    """)
-
-    conn.commit()
-    conn.close()
-
-################################
-# USER MANAGEMENT
-################################
-
-def create_user(full_name, email, password_plain, is_admin=False):
-    conn = get_conn()
-    cur = conn.cursor()
-    hashed_pw = generate_password_hash(password_plain)
-    cur.execute(
-        """
-        INSERT INTO users (full_name, email, hashed_password, is_admin)
-        VALUES (?, ?, ?, ?)
-        """,
-        (full_name, email, hashed_pw, 1 if is_admin else 0),
-    )
-    conn.commit()
-    conn.close()
-
-def verify_user(email, password_plain):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE email = ?", (email,))
-    row = cur.fetchone()
-    if row and check_password_hash(row["hashed_password"], password_plain):
-        user = dict(row)
-        # Update last_login_at
+    # Users
+    if not _table_exists(conn, "users"):
         cur.execute(
-            "UPDATE users SET last_login_at = ? WHERE id = ?",
-            (datetime.utcnow().isoformat(), row["id"]),
-        )
-        conn.commit()
-        conn.close()
-        return user
-    conn.close()
-    return None
+            """
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                full_name TEXT,
+                email TEXT UNIQUE,
 
-def get_user_by_id(user_id: int):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    row = cur.fetchone()
+                -- canonical column
+                password_hash TEXT,
+
+                -- legacy installs may also have 'hashed_password' (keep if present)
+                is_admin INTEGER DEFAULT 0,
+
+                -- Emergency contact
+                emergency_name TEXT,
+                emergency_email TEXT,
+                emergency_relation TEXT,
+
+                -- Subscription / billing
+                plan TEXT DEFAULT 'FREE',
+                subscription_start TEXT,
+                subscription_end TEXT,
+                is_premium INTEGER DEFAULT 0,
+                last_payment_amount REAL,
+                last_payment_currency TEXT,
+                last_payment_provider TEXT,
+                payment_status TEXT
+            );
+            """
+        )
+
+    # Documents
+    if not _table_exists(conn, "documents"):
+        cur.execute(
+            """
+            CREATE TABLE documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                filename_original TEXT,
+                stored_path TEXT,
+                file_type TEXT,
+                size_kb INTEGER,
+                category TEXT,
+                notes TEXT,
+                uploaded_at TEXT DEFAULT (datetime('now')),
+                expiry_date TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            """
+        )
+
+    # Activity log
+    if not _table_exists(conn, "activity_log"):
+        cur.execute(
+            """
+            CREATE TABLE activity_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action TEXT,
+                doc_id INTEGER,
+                details TEXT,
+                timestamp TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            """
+        )
+
+    # Payments
+    if not _table_exists(conn, "payments"):
+        cur.execute(
+            """
+            CREATE TABLE payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                provider TEXT,         -- 'paystack' | 'flutterwave' | 'stripe' | 'bank transfer'
+                currency TEXT,         -- NGN | USD
+                amount REAL,
+                paid_at TEXT DEFAULT (datetime('now')),
+                reference TEXT,        -- user-submitted reference/narration
+                raw_json TEXT,         -- optional payload
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            """
+        )
+
+    # Safe column upgrades (idempotent)
+    upgrades: List[Tuple[str, str, str, str]] = [
+        ("users", "password_hash", "TEXT", "NULL"),
+        ("users", "is_admin", "INTEGER", "0"),
+        ("users", "emergency_name", "TEXT", "NULL"),
+        ("users", "emergency_email", "TEXT", "NULL"),
+        ("users", "emergency_relation", "TEXT", "NULL"),
+        ("users", "plan", "TEXT", "'FREE'"),
+        ("users", "subscription_start", "TEXT", "NULL"),
+        ("users", "subscription_end", "TEXT", "NULL"),
+        ("users", "is_premium", "INTEGER", "0"),
+        ("users", "last_payment_amount", "REAL", "NULL"),
+        ("users", "last_payment_currency", "TEXT", "NULL"),
+        ("users", "last_payment_provider", "TEXT", "NULL"),
+        ("users", "payment_status", "TEXT", "NULL"),
+    ]
+    for table, column, coltype, default_val in upgrades:
+        if not _column_exists(conn, table, column):
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype} DEFAULT {default_val};")
+
+    # Ensure payments has 'reference' and 'raw_json'
+    if not _column_exists(conn, "payments", "reference"):
+        cur.execute("ALTER TABLE payments ADD COLUMN reference TEXT;")
+    if not _column_exists(conn, "payments", "raw_json"):
+        cur.execute("ALTER TABLE payments ADD COLUMN raw_json TEXT;")
+
+    conn.commit()
     conn.close()
+
+# ================= Users (get/set) =================
+def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE id=?;", (user_id,))
+    row = cur.fetchone(); conn.close()
     return dict(row) if row else None
 
-def update_emergency_contact(user_id: int, name: str, email: str, relation: str):
-    """
-    Save or update the emergency contact fields for this user.
-    """
-    conn = get_conn()
-    cur = conn.cursor()
+def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    email = _norm_email(email)
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE lower(email)=?;", (email,))
+    row = cur.fetchone(); conn.close()
+    return dict(row) if row else None
+
+def set_admin_flag(user_id: int, is_admin: bool) -> None:
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("UPDATE users SET is_admin=? WHERE id=?;", (1 if is_admin else 0, user_id))
+    conn.commit(); conn.close()
+
+def has_admin() -> bool:
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT 1 FROM users WHERE is_admin=1 LIMIT 1;")
+    row = cur.fetchone(); conn.close()
+    return bool(row)
+
+def update_emergency_contact(user_id: int, name: str, email: str, relation: str) -> None:
+    conn = get_conn(); cur = conn.cursor()
     cur.execute(
-        """
-        UPDATE users
-        SET emergency_name = ?,
-            emergency_email = ?,
-            emergency_relation = ?
-        WHERE id = ?
-        """,
+        "UPDATE users SET emergency_name=?, emergency_email=?, emergency_relation=? WHERE id=?;",
         (name, email, relation, user_id),
     )
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
-def update_user_premium(user_id: int, amount=20.00, currency="USD"):
-    """
-    Mark the user as Premium Lifetime (unlimited docs) and log a payment.
-    """
-    now = datetime.utcnow().isoformat()
-    conn = get_conn()
-    cur = conn.cursor()
+# ================= Authentication =================
+def ensure_user_columns():
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("PRAGMA table_info(users);")
+    cols = [r[1] for r in cur.fetchall()]
+    if "password_hash" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN password_hash TEXT;")
+    if "is_admin" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0;")
+    conn.commit(); conn.close()
 
-    # 1. Update user premium status
+
+# db.py — replace your current create_user with this version
+def create_user(full_name: str, email: str, password: str, is_admin: bool = False) -> Optional[Dict[str, Any]]:
+    ensure_user_columns()
+    email = _norm_email(email)
+    if not (full_name and email and password):
+        return None
+    if get_user_by_email(email):
+        return None
+
+    # 🚫 If any admin already exists, force new signups to non-admin
+    try:
+        admin_exists = has_admin()
+    except Exception:
+        admin_exists = True  # safest default: don't allow accidental admin creation
+
+    effective_is_admin = (is_admin and not admin_exists)
+
+    pw_hash = generate_password_hash(password)
+    cols = _users_columns()
+
+    insert_cols = ["full_name", "email", "is_admin"]
+    params = [full_name.strip(), email, 1 if effective_is_admin else 0]
+
+    if "password_hash" in cols:
+        insert_cols.append("password_hash")
+        params.append(pw_hash)
+    if "hashed_password" in cols:
+        insert_cols.append("hashed_password")
+        params.append(pw_hash)
+
+    placeholders = ", ".join("?" for _ in insert_cols)
+    sql = f"INSERT INTO users ({', '.join(insert_cols)}) VALUES ({placeholders});"
+
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(sql, params)
+    conn.commit(); conn.close()
+    return get_user_by_email(email)
+
+def verify_user(email: str, password: str) -> Optional[Dict[str, Any]]:
+    ensure_user_columns()
+    email = _norm_email(email)
+    u = get_user_by_email(email)
+    if not u:
+        return None
+    pw_hash = u.get("password_hash") or u.get("hashed_password") or ""
+    try:
+        ok = check_password_hash(pw_hash, password or "")
+    except Exception:
+        ok = False
+    return u if ok else None
+
+def update_password(user_id: int, new_password: str) -> None:
+    ensure_user_columns()
+    pw_hash = generate_password_hash(new_password)
+    cols = _users_columns()
+
+    sets = []
+    params: List[Any] = []
+    if "password_hash" in cols:
+        sets.append("password_hash=?")
+        params.append(pw_hash)
+    if "hashed_password" in cols:
+        sets.append("hashed_password=?")
+        params.append(pw_hash)
+    sets_sql = ", ".join(sets) if sets else "password_hash=?"
+    if not sets:
+        params.append(pw_hash)
+
+    params.append(user_id)
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(f"UPDATE users SET {sets_sql} WHERE id=?;", params)
+    conn.commit(); conn.close()
+
+# ========= Subscription & Billing =========
+def compute_subscription_status(u: Dict[str, Any]) -> str:
+    """
+    'active'  : today <= subscription_end
+    'grace'   : subscription_end < today <= subscription_end + GRACE_DAYS
+    'expired' : today > subscription_end + GRACE_DAYS OR missing/invalid
+    """
+    if not u:
+        return "expired"
+    end_str = u.get("subscription_end")
+    if not end_str:
+        return "expired"
+    try:
+        end = dt.date.fromisoformat(end_str)
+    except Exception:
+        return "expired"
+    today = dt.date.today()
+    if today <= end:
+        return "active"
+    if today <= end + dt.timedelta(days=GRACE_DAYS):
+        return "grace"
+    return "expired"
+
+def subscription_days_left(u: Dict[str, Any]) -> int:
+    if not u or not u.get("subscription_end"):
+        return 0
+    try:
+        end = dt.date.fromisoformat(u["subscription_end"])
+    except Exception:
+        return 0
+    return (end - dt.date.today()).days
+
+def is_subscription_active(u: Dict[str, Any]) -> bool:
+    return compute_subscription_status(u) == "active"
+
+def is_subscription_locked(u: Dict[str, Any]) -> bool:
+    return compute_subscription_status(u) == "expired"
+
+def set_subscription(user_id: int, start: dt.date, end: dt.date, amount: float, currency: str, provider: str) -> None:
+    conn = get_conn(); cur = conn.cursor()
     cur.execute(
         """
-        UPDATE users
-        SET is_premium = 1,
-            premium_activated_at = ?,
-            premium_amount = ?
-        WHERE id = ?
+        UPDATE users SET
+            plan='ANNUAL',
+            subscription_start=?,
+            subscription_end=?,
+            is_premium=1,
+            last_payment_amount=?,
+            last_payment_currency=?,
+            last_payment_provider=?,
+            payment_status='active'
+        WHERE id=?;
         """,
-        (now, amount, user_id),
+        (start.isoformat(), end.isoformat(), amount, currency, provider, user_id),
     )
+    conn.commit(); conn.close()
 
-    # 2. Insert a payment record for audit purposes
-    ref_code = f"MANUAL-{user_id}-{now}"
+def update_payment_status(user_id: int, status: str) -> None:
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("UPDATE users SET payment_status=? WHERE id=?;", (status, user_id))
+    conn.commit(); conn.close()
+
+def record_payment_submission(user_id: int, provider: str, currency: str, amount: float, reference: str):
+    conn = get_conn(); cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO payments
-        (user_id, amount, currency, provider, reference_code, paid_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO payments (user_id, provider, currency, amount, reference, raw_json)
+        VALUES (?, ?, ?, ?, ?, ?);
         """,
-        (user_id, amount, currency, "manual", ref_code, now),
+        (user_id, provider.lower(), currency.upper(), amount, reference.strip(), "submitted_by_user"),
     )
+    conn.commit(); conn.close()
 
-    conn.commit()
-    conn.close()
-
-################################
-# DOCUMENT MANAGEMENT
-################################
-
-def count_user_documents(user_id: int):
-    conn = get_conn()
-    cur = conn.cursor()
+def list_pending_payment_refs() -> List[Dict[str, Any]]:
+    conn = get_conn(); cur = conn.cursor()
     cur.execute(
         """
-        SELECT COUNT(*) as c
-        FROM documents
-        WHERE user_id = ?
-        """,
-        (user_id,),
+        SELECT p.id AS pid, p.user_id, u.full_name, u.email,
+               p.provider, p.currency, p.amount, p.reference, p.paid_at, u.payment_status
+        FROM payments p
+        LEFT JOIN users u ON u.id = p.user_id
+        WHERE COALESCE(u.payment_status,'')='pending'
+        ORDER BY p.id DESC;
+        """
     )
-    row = cur.fetchone()
+    rows = [dict(r) for r in cur.fetchall()]
     conn.close()
-    return row["c"] if row else 0
+    return rows
 
-def get_user_documents(user_id: int, search_text: str = "", category_filter: str = ""):
-    conn = get_conn()
-    cur = conn.cursor()
-    base_query = """
-        SELECT * FROM documents
-        WHERE user_id = ?
+
+# --- add these helpers anywhere below your subscription functions ---
+
+def has_active_or_free_quota(u: Dict[str, Any], used_count: int, free_limit: int = 5) -> bool:
     """
-    params = [user_id]
+    Returns True if:
+      - user is FREE and used_count < free_limit, OR
+      - user has an ACTIVE subscription.
+    """
+    plan = (u.get("plan") or "FREE").upper()
+    status = compute_subscription_status(u)
+    if plan == "FREE":
+        return used_count < free_limit
+    return status == "active"
 
-    if search_text:
-        base_query += " AND (filename_original LIKE ? OR notes LIKE ?)"
-        like_str = f"%{search_text}%"
-        params.extend([like_str, like_str])
+def is_account_locked(u: Dict[str, Any]) -> bool:
+    """
+    Lock the account (no access) ONLY if the user once subscribed (plan != FREE)
+    and the subscription is fully expired (GRACE_DAYS=0).
+    FREE users (never paid) are NOT locked—they can use their 5 free uploads.
+    """
+    plan = (u.get("plan") or "FREE").upper()
+    if plan == "FREE":
+        return False
+    return compute_subscription_status(u) == "expired"
 
-    if category_filter and category_filter != "All":
-        base_query += " AND (category = ?)"
-        params.append(category_filter)
+def needs_renewal_reminder(u: Dict[str, Any]) -> bool:
+    """
+    True when user has an active subscription that will end within 7 days.
+    """
+    plan = (u.get("plan") or "FREE").upper()
+    if plan == "FREE":
+        return False
+    days = subscription_days_left(u)
+    return 0 < days <= 7
 
-    base_query += " ORDER BY uploaded_at DESC"
 
-    cur.execute(base_query, tuple(params))
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-def insert_document_record(
+# ================== Documents ===================
+def insert_document(
     user_id: int,
     filename_original: str,
     stored_path: str,
     file_type: str,
-    category: str,
-    notes: str,
-    expiry_date: str,
     size_kb: int,
-    is_generated: bool = False,
-):
-    conn = get_conn()
-    cur = conn.cursor()
+    category: Optional[str] = None,
+    notes: Optional[str] = None,
+    expiry_date: Optional[str] = None,
+) -> int:
+    conn = get_conn(); cur = conn.cursor()
     cur.execute(
         """
         INSERT INTO documents
-        (user_id, filename_original, stored_path, file_type,
-         category, notes, expiry_date, size_kb, is_generated)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (user_id, filename_original, stored_path, file_type, size_kb, category, notes, expiry_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
         """,
-        (
-            user_id,
-            filename_original,
-            stored_path,
-            file_type,
-            category,
-            notes,
-            expiry_date,
-            size_kb,
-            1 if is_generated else 0,
-        ),
+        (user_id, filename_original, stored_path, file_type, size_kb, category, notes, expiry_date),
     )
     doc_id = cur.lastrowid
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
     return doc_id
 
-def delete_document(user_id: int, doc_id: int):
-    """
-    Delete both DB row and physical file, but only if it belongs to this user.
-    """
-    import os
+def get_user_documents(user_id: int, search_text: str = "", category_filter: str = "All") -> List[Dict[str, Any]]:
+    conn = get_conn(); cur = conn.cursor()
+    where = ["user_id = ?"]
+    params: List[Any] = [user_id]
+    if search_text:
+        where.append("(lower(filename_original) LIKE ? OR lower(notes) LIKE ?)")
+        like = f"%{search_text.lower()}%"
+        params.extend([like, like])
+    if category_filter and category_filter != "All":
+        where.append("category = ?")
+        params.append(category_filter)
+    sql = f"SELECT * FROM documents WHERE {' AND '.join(where)} ORDER BY uploaded_at DESC;"
+    cur.execute(sql, tuple(params))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
 
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT * FROM documents WHERE id = ? AND user_id = ?",
-        (doc_id, user_id),
-    )
+def count_user_documents(user_id: int) -> int:
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) AS c FROM documents WHERE user_id=?;", (user_id,))
+    row = cur.fetchone(); conn.close()
+    return int(row["c"] if row else 0)
+
+def delete_document(user_id: int, doc_id: int) -> bool:
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT id FROM documents WHERE id=? AND user_id=?;", (doc_id, user_id))
     row = cur.fetchone()
     if not row:
         conn.close()
         return False
-
-    stored_path = row["stored_path"]
-
-    # 1. remove file
-    try:
-        if os.path.exists(stored_path):
-            os.remove(stored_path)
-    except Exception:
-        pass
-
-    # 2. remove row
-    cur.execute(
-        "DELETE FROM documents WHERE id = ? AND user_id = ?",
-        (doc_id, user_id),
-    )
-
-    conn.commit()
-    conn.close()
+    cur.execute("DELETE FROM documents WHERE id=?;", (doc_id,))
+    conn.commit(); conn.close()
     return True
 
-################################
-# ACTIVITY LOG
-################################
-
-def log_activity(user_id: int, action: str, document_id: int = None, details: str = ""):
-    conn = get_conn()
-    cur = conn.cursor()
+# ================== Activity ====================
+def log_activity(user_id: int, action: str, doc_id: Optional[int] = None, details: Optional[str] = None) -> None:
+    conn = get_conn(); cur = conn.cursor()
     cur.execute(
-        """
-        INSERT INTO activity_log (user_id, action, document_id, details)
-        VALUES (?, ?, ?, ?)
-        """,
-        (user_id, action, document_id, details),
+        "INSERT INTO activity_log (user_id, action, doc_id, details) VALUES (?, ?, ?, ?);",
+        (user_id, action, doc_id, details),
     )
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
-def get_recent_activity(user_id: int, limit: int = 20):
-    conn = get_conn()
-    cur = conn.cursor()
+def get_recent_activity(user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+    conn = get_conn(); cur = conn.cursor()
     cur.execute(
-        """
-        SELECT * FROM activity_log
-        WHERE user_id = ?
-        ORDER BY timestamp DESC
-        LIMIT ?
-        """,
+        "SELECT * FROM activity_log WHERE user_id=? ORDER BY timestamp DESC LIMIT ?;",
         (user_id, limit),
     )
-    rows = cur.fetchall()
+    rows = [dict(r) for r in cur.fetchall()]
     conn.close()
-    return [dict(r) for r in rows]
+    return rows
 
-################################
-# ADMIN
-################################
-
-def admin_list_users_with_usage():
-    """
-    Return a list of rows like:
-    {
-        id,
-        full_name,
-        email,
-        is_premium,
-        is_admin,
-        last_login_at,
-        doc_count
-    }
-    """
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT
-            u.id,
-            u.full_name,
-            u.email,
-            u.is_premium,
-            u.is_admin,
-            u.last_login_at,
-            COUNT(d.id) as doc_count
-        FROM users u
-        LEFT JOIN documents d
-        ON u.id = d.user_id
-        GROUP BY u.id
-        ORDER BY u.created_at DESC
-        """
-    )
-    rows = cur.fetchall()
+# ================= Admin listings ===============
+def list_users(search: str = "") -> List[Dict[str, Any]]:
+    conn = get_conn(); cur = conn.cursor()
+    if search:
+        like = f"%{search.lower()}%"
+        cur.execute(
+            """
+            SELECT * FROM users
+            WHERE lower(full_name) LIKE ? OR lower(email) LIKE ?
+            ORDER BY id DESC;
+            """,
+            (like, like),
+        )
+    else:
+        cur.execute("SELECT * FROM users ORDER BY id DESC;")
+    rows = [dict(r) for r in cur.fetchall()]
     conn.close()
-    return [dict(r) for r in rows]
-
-
-def delete_user_and_data(user_id: int):
-    import os
-    conn = get_conn()
-    cur = conn.cursor()
-
-    # 1. Get all docs for this user
-    cur.execute("SELECT stored_path FROM documents WHERE user_id = ?", (user_id,))
-    rows = cur.fetchall()
-
-    # 2. Delete physical files
-    for r in rows:
-        try:
-            path = r["stored_path"]
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception:
-            pass
-
-    # 3. Delete rows in documents
-    cur.execute("DELETE FROM documents WHERE user_id = ?", (user_id,))
-
-    # 4. Delete activity logs
-    cur.execute("DELETE FROM activity_log WHERE user_id = ?", (user_id,))
-
-    # 5. Delete payments record (optional keep for audit? for MVP let's delete)
-    cur.execute("DELETE FROM payments WHERE user_id = ?", (user_id,))
-
-    # 6. Finally delete the user
-    cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
-
-    conn.commit()
-    conn.close()
-
+    return rows
