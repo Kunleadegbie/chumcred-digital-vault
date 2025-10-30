@@ -45,6 +45,7 @@ def init_db():
     conn = get_conn()
     cur = conn.cursor()
 
+
     # Users
     if not _table_exists(conn, "users"):
         cur.execute(
@@ -114,7 +115,11 @@ def init_db():
             """
         )
 
-    # Payments
+         # inside init_db(), after creating activity_log (or at the end of init_db)
+         ensure_activity_log_columns()
+
+   
+ # Payments
     if not _table_exists(conn, "payments"):
         cur.execute(
             """
@@ -464,13 +469,26 @@ def delete_document(user_id: int, doc_id: int) -> bool:
     return True
 
 # ================== Activity ====================
-def log_activity(user_id: int, action: str, doc_id: Optional[int] = None, details: Optional[str] = None) -> None:
-    conn = get_conn(); cur = conn.cursor()
+
+# --- in db.py ---
+
+def ensure_activity_log_columns():
+    con = get_conn(); cur = con.cursor()
+    cur.execute("PRAGMA table_info(activity_log);")
+    cols = [r[1] for r in cur.fetchall()]
+    if "doc_id" not in cols:
+        cur.execute("ALTER TABLE activity_log ADD COLUMN doc_id INTEGER;")
+    con.commit(); con.close()
+
+def log_activity(user_id: int, action: str, doc_id: int | None = None, details: str | None = None) -> None:
+    # auto-heal before inserting
+    ensure_activity_log_columns()
+    con = get_conn(); cur = con.cursor()
     cur.execute(
         "INSERT INTO activity_log (user_id, action, doc_id, details) VALUES (?, ?, ?, ?);",
         (user_id, action, doc_id, details),
     )
-    conn.commit(); conn.close()
+    con.commit(); con.close()
 
 def get_recent_activity(user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
     conn = get_conn(); cur = conn.cursor()

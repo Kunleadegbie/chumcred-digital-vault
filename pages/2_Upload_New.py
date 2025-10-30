@@ -7,6 +7,9 @@ from db import (
     is_subscription_active, is_account_locked
 )
 from storage import save_uploaded_file, ALLOWED_EXTENSIONS
+from db import init_db
+init_db()  # safe/idempotent, ensures tables/columns exist before this page runs
+
 
 FREE_LIMIT = 5
 CATEGORY_OPTIONS = [
