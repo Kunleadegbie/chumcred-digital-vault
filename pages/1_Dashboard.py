@@ -1,139 +1,144 @@
-# pages/1_Dashboard.py  (only the top imports + pre-title guard lines are new)
+# pages/1_Dashboard.py
+# -*- coding: utf-8 -*-
+"""
+Chumcred Vault — Dashboard
+Shows plan status, documents list (download/delete), and recent activity.
+"""
 
-from billing import guard_access, show_subscription_banner
-
+import os
 import streamlit as st
-from billing import guard_access, show_subscription_banner
+
 from auth import get_current_user
 from db import (
-    get_user_documents, count_user_documents, delete_document, log_activity, get_recent_activity,
-    is_account_locked, needs_renewal_reminder, subscription_days_left
+    get_user_documents,
+    count_user_documents,
+    delete_document,
+    log_activity,
+    get_recent_activity,
+    compute_subscription_status,
+    subscription_days_left,
 )
-import os
 
 FREE_LIMIT = 5
 
-def main():
-    user = get_current_user()
-    if not user:
-        st.error("Please sign in.")
-        st.stop()
 
-    guard_access(user)             # ✅ prevents expired subscribers from accessing
-    show_subscription_banner(user) # (optional) shows Free 5/5 usage banner
+def show_plan_status(user: dict, used_count: int) -> None:
+    """
+    Render plan/usage status and guard expired accounts.
+    - FREE: shows 5-document limit usage banner
+    - ANNUAL (active): success banner
+    - ANNUAL (grace): warning banner
+    - ANNUAL (expired): hard lock (stop)
+    """
+    plan = (user.get("plan") or "FREE").upper()
+    status = compute_subscription_status(user)
 
-
-    # Hard lock ONLY for subscribed-but-expired users
-    if is_account_locked(user):
-        st.error("Your subscription has expired. Access is locked until payment is confirmed by Admin.")
-        st.info("Go to **Settings → Upgrade / Renewal** to submit your payment reference.")
-        st.stop()
-
-    st.title("Your Secure Vault 🔐")
-
-    # Renewal reminder banner (7 days)
-    if needs_renewal_reminder(user):
-        st.warning(f"Your subscription will expire in {max(subscription_days_left(user),0)} day(s). "
-                   "Please renew to avoid lockout.")
-
-    used = count_user_documents(user["id"])
-
-    # ... keep your existing dashboard UI (plan status, docs table, etc.)
-    # (No change to your existing functions render)
-
-
-def show_plan_status(user, used_count: int):
-    col1, col2 = st.columns([2, 1])
+    col1, col2 = st.columns([3, 1])
     with col1:
-        if user.get("is_premium"):
-            st.markdown("✅ **Premium Annual Plan** (Unlimited Storage Active)")
-            st.caption("Your annual plan is active. Enjoy unlimited uploads.")
+        if plan == "FREE":
+            st.info(f"🔓 Free Plan — {used_count}/{FREE_LIMIT} documents used. "
+                    f"Upload up to {FREE_LIMIT} docs for free. "
+                    "Upgrade to continue after the limit.")
         else:
-            st.markdown(f"🔓 **Free Plan** · {used_count}/{FREE_LIMIT} documents used")
-            st.info(
-                "After 5 uploads, please upgrade. Annual plan costs ₦35,000 or $20 — "
-                "renewable yearly (₦25,000 / $15 on anniversary)."
-            )
+            if status == "active":
+                days = max(subscription_days_left(user), 0)
+                st.success(f"✅ Annual Plan — Active. Unlimited uploads enabled. "
+                           f"{days} day(s) left in this cycle.")
+            elif status == "grace":
+                days = max(subscription_days_left(user), 0)
+                # days will be negative or small if you consider grace; keep a friendly message:
+                st.warning("⚠️ Annual Plan — Grace period. Please renew soon to avoid lockout.")
+            else:
+                st.error("⛔ Your subscription has expired. Access is locked until an admin confirms renewal payment. "
+                         "Go to **Settings → Upgrade / Renewal** to submit a payment reference.")
+                st.stop()  # hard lock for subscribed-but-expired users
     with col2:
         st.metric("Total Docs", used_count)
 
 
-def show_document_table(user_id: int, docs: list):
+def show_document_table(user_id: int, docs: list) -> None:
     st.subheader("Your Documents")
     if not docs:
-        st.write("No documents yet.")
+        st.caption("No documents yet.")
         return
 
     for doc in docs:
-        with st.expander(f"📄 {doc['filename_original']}"):
+        title = f"📄 {doc.get('filename_original') or 'Untitled'}"
+        with st.expander(title, expanded=False):
             c1, c2, c3 = st.columns([2, 2, 1])
+
             with c1:
-                st.write(f"Category: {doc.get('category') or '-'}")
-                st.write(f"Uploaded: {doc.get('uploaded_at')}")
-                st.write(f"Type: {doc.get('file_type')}")
-                st.write(f"Size: {doc.get('size_kb')} KB")
+                st.write(f"**Category:** {doc.get('category') or '—'}")
+                st.write(f"**Uploaded:** {doc.get('uploaded_at') or '—'}")
+                st.write(f"**Type:** {doc.get('file_type') or '—'}")
+                size_kb = doc.get("size_kb")
+                st.write(f"**Size:** {size_kb} KB" if size_kb is not None else "**Size:** —")
 
             with c2:
-                st.write("Notes:")
+                st.write("**Notes:**")
                 st.write(doc.get("notes") or "—")
                 expiry_date = doc.get("expiry_date")
                 if expiry_date:
-                    st.warning(f"Expiry Date: {expiry_date}")
+                    st.warning(f"**Expiry Date:** {expiry_date}")
                 else:
                     st.caption("No expiry set")
 
             with c3:
                 stored_path = doc.get("stored_path")
-                if os.path.exists(stored_path):
-                    with open(stored_path, "rb") as f:
-                        st.download_button(
-                            "Download",
-                            data=f.read(),
-                            file_name=doc["filename_original"],
-                            key=f"dl_{doc['id']}",
-                        )
+                # Download (only if file is present on disk)
+                if stored_path and os.path.exists(stored_path):
+                    try:
+                        with open(stored_path, "rb") as f:
+                            st.download_button(
+                                "Download",
+                                data=f.read(),
+                                file_name=doc.get("filename_original") or "document",
+                                key=f"dl_{doc['id']}",
+                            )
+                    except Exception:
+                        st.caption("File not readable on server.")
+                else:
+                    st.caption("File not present on this server.")
 
+                # Delete
                 if st.button("Delete", key=f"del_{doc['id']}"):
                     ok = delete_document(user_id, doc["id"])
                     if ok:
                         log_activity(
-                            user_id,
-                            "delete",
-                            doc["id"],
-                            details=f"Deleted {doc['filename_original']}",
+                            user_id=user_id,
+                            action="delete",
+                            doc_id=doc["id"],
+                            details=f"Deleted {doc.get('filename_original')}",
                         )
-                        st.success("Deleted. Please refresh this page.")
+                        st.success("Deleted. Refresh this page to update the list.")
                     else:
-                        st.error("Delete failed or not allowed.")
+                        st.error("Delete failed (not allowed or missing).")
 
 
-def show_activity(user_id: int):
+def show_activity(user_id: int) -> None:
     st.subheader("Recent Activity")
     events = get_recent_activity(user_id)
     if not events:
         st.caption("No recent activity yet.")
-    else:
-        for e in events:
-            st.write(f"- {e['timestamp']}: {e['action']} {e['details'] or ''}")
+        return
+    for e in events:
+        when = e.get("timestamp") or "—"
+        action = e.get("action") or "—"
+        details = e.get("details") or ""
+        st.write(f"- {when}: **{action}** {details}")
 
 
-def main():
-    # 1️⃣ Load the user first
+def main() -> None:
     user = get_current_user()
     if not user:
         st.error("Please sign in.")
         st.stop()
 
-    # 2️⃣ Subscription checks
-    guard_access(user)
-    show_subscription_banner(user)
-
-    # 3️⃣ Dashboard content
     st.title("Your Secure Vault 🔐")
+
     used = count_user_documents(user["id"])
     show_plan_status(user, used)
 
-    # 4️⃣ Search/filter
     st.divider()
     st.caption("Filter your vault")
     col_search, col_cat = st.columns([2, 1])
@@ -157,15 +162,15 @@ def main():
 
     docs = get_user_documents(
         user_id=user["id"],
-        search_text=search_text.strip(),
+        search_text=(search_text or "").strip(),
         category_filter=category_filter,
     )
-
     show_document_table(user["id"], docs)
 
     st.divider()
     show_activity(user["id"])
 
+    st.write("---")
     st.caption("Powered by Chumcred Limited")
 
 

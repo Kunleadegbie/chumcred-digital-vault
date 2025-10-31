@@ -1,14 +1,11 @@
 # auth.py
 # -*- coding: utf-8 -*-
+"""Authentication helpers for Chumcred Vault."""
 
 import streamlit as st
 from typing import Optional, Dict, Any
 
-from db import (
-    verify_user,
-    get_user_by_id,
-    get_user_by_email,
-)
+from db import verify_user, get_user_by_id, get_user_by_email
 
 
 def login_user(email: str, password: str) -> Optional[Dict[str, Any]]:
@@ -18,7 +15,7 @@ def login_user(email: str, password: str) -> Optional[Dict[str, Any]]:
     """
     user = verify_user(email, password)
     if user:
-        st.session_state.user = user
+        st.session_state["user"] = user
         return user
     return None
 

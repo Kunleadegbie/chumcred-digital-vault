@@ -1,26 +1,41 @@
-
 # db.py
+# -*- coding: utf-8 -*-
+"""
+Chumcred Vault Database Module
+Handles user authentication, documents, activity log, payments, and subscriptions.
+"""
+
 import os
 import sqlite3
 import datetime as dt
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# ===================== Config =====================
-DB_PATH = os.getenv("VAULT_DB_PATH", os.path.join(os.path.dirname(__file__), "vault.db"))
-GRACE_DAYS = int(os.getenv("GRACE_DAYS", "0"))  # lock immediately after expiry
+# ---------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------
+# Tip: For Streamlit Cloud, set env VAULT_DB_PATH=/tmp/vault.db
+DEFAULT_DB = os.path.join(os.path.dirname(__file__), "vault.db")
+DB_PATH = os.getenv("VAULT_DB_PATH", DEFAULT_DB)
+GRACE_DAYS = int(os.getenv("GRACE_DAYS", "7"))  # grace period after expiry
 
-# ===================== Connection =================
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
-# ============== Introspection helpers =============
+
+# ---------------------------------------------------------------------
+# INTERNAL HELPERS
+# ---------------------------------------------------------------------
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     cur = conn.cursor()
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (name,))
     return cur.fetchone() is not None
+
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     cur = conn.cursor()
@@ -28,23 +43,35 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     cols = [r[1] for r in cur.fetchall()]
     return column in cols
 
-def _users_columns() -> set:
+
+def _users_has_column(col: str) -> bool:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("PRAGMA table_info(users);")
-    cols = {row[1] for row in cur.fetchall()}
+    cols = [r[1] for r in cur.fetchall()]
     conn.close()
-    return cols
+    return col in cols
 
-def _norm_email(email: str) -> str:
-    return (email or "").strip().lower()
 
-# ============== Schema init & upgrades =============
-def init_db():
-    """Create base tables if missing; add new columns safely for older DBs."""
+def ensure_activity_log_columns() -> None:
+    """Ensure activity_log has doc_id column for older DBs."""
     conn = get_conn()
     cur = conn.cursor()
+    cur.execute("PRAGMA table_info(activity_log);")
+    cols = [r[1] for r in cur.fetchall()]
+    if "doc_id" not in cols:
+        cur.execute("ALTER TABLE activity_log ADD COLUMN doc_id INTEGER;")
+    conn.commit()
+    conn.close()
 
+
+# ---------------------------------------------------------------------
+# INITIALIZATION / MIGRATIONS
+# ---------------------------------------------------------------------
+def init_db() -> None:
+    """Create base tables if missing; safely add new columns for older DBs."""
+    conn = get_conn()
+    cur = conn.cursor()
 
     # Users
     if not _table_exists(conn, "users"):
@@ -54,19 +81,12 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 full_name TEXT,
                 email TEXT UNIQUE,
-
-                -- canonical column
                 password_hash TEXT,
-
-                -- legacy installs may also have 'hashed_password' (keep if present)
+                -- legacy projects may have 'hashed_password' NOT NULL; we'll migrate below
                 is_admin INTEGER DEFAULT 0,
-
-                -- Emergency contact
                 emergency_name TEXT,
                 emergency_email TEXT,
                 emergency_relation TEXT,
-
-                -- Subscription / billing
                 plan TEXT DEFAULT 'FREE',
                 subscription_start TEXT,
                 subscription_end TEXT,
@@ -115,184 +135,366 @@ def init_db():
             """
         )
 
-         # inside init_db(), after creating activity_log (or at the end of init_db)
-         ensure_activity_log_columns()
-
-   
- # Payments
+    # Payments
     if not _table_exists(conn, "payments"):
         cur.execute(
             """
             CREATE TABLE payments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
-                provider TEXT,         -- 'paystack' | 'flutterwave' | 'stripe' | 'bank transfer'
-                currency TEXT,         -- NGN | USD
+                provider TEXT,
+                currency TEXT,
                 amount REAL,
                 paid_at TEXT DEFAULT (datetime('now')),
-                reference TEXT,        -- user-submitted reference/narration
-                raw_json TEXT,         -- optional payload
+                reference TEXT,
+                raw_json TEXT,
                 FOREIGN KEY(user_id) REFERENCES users(id)
             );
             """
         )
 
     # Safe column upgrades (idempotent)
-    upgrades: List[Tuple[str, str, str, str]] = [
-        ("users", "password_hash", "TEXT", "NULL"),
-        ("users", "is_admin", "INTEGER", "0"),
-        ("users", "emergency_name", "TEXT", "NULL"),
-        ("users", "emergency_email", "TEXT", "NULL"),
-        ("users", "emergency_relation", "TEXT", "NULL"),
-        ("users", "plan", "TEXT", "'FREE'"),
-        ("users", "subscription_start", "TEXT", "NULL"),
-        ("users", "subscription_end", "TEXT", "NULL"),
-        ("users", "is_premium", "INTEGER", "0"),
-        ("users", "last_payment_amount", "REAL", "NULL"),
-        ("users", "last_payment_currency", "TEXT", "NULL"),
-        ("users", "last_payment_provider", "TEXT", "NULL"),
-        ("users", "payment_status", "TEXT", "NULL"),
-    ]
-    for table, column, coltype, default_val in upgrades:
+    def _addcol(table: str, column: str, decl: str):
         if not _column_exists(conn, table, column):
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype} DEFAULT {default_val};")
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl};")
 
-    # Ensure payments has 'reference' and 'raw_json'
-    if not _column_exists(conn, "payments", "reference"):
-        cur.execute("ALTER TABLE payments ADD COLUMN reference TEXT;")
-    if not _column_exists(conn, "payments", "raw_json"):
-        cur.execute("ALTER TABLE payments ADD COLUMN raw_json TEXT;")
+    _addcol("users", "password_hash", "TEXT")
+    _addcol("users", "is_admin", "INTEGER DEFAULT 0")
+    _addcol("users", "plan", "TEXT DEFAULT 'FREE'")
+    _addcol("users", "subscription_start", "TEXT")
+    _addcol("users", "subscription_end", "TEXT")
+    _addcol("users", "last_payment_amount", "REAL")
+    _addcol("users", "last_payment_currency", "TEXT")
+    _addcol("users", "last_payment_provider", "TEXT")
+    _addcol("users", "payment_status", "TEXT")
+    _addcol("payments", "reference", "TEXT")
+    _addcol("payments", "raw_json", "TEXT")
+
+    # ---- Legacy compatibility migration ('hashed_password' -> 'password_hash') ----
+    # If the table still has a legacy 'hashed_password' column, ensure password_hash exists and copy values.
+    if _column_exists(conn, "users", "hashed_password"):
+        if not _column_exists(conn, "users", "password_hash"):
+            cur.execute("ALTER TABLE users ADD COLUMN password_hash TEXT;")
+        cur.execute(
+            """
+            UPDATE users
+               SET password_hash = COALESCE(password_hash, hashed_password)
+             WHERE hashed_password IS NOT NULL
+               AND (password_hash IS NULL OR password_hash = '');
+            """
+        )
+
+    conn.commit()
+    ensure_activity_log_columns()
+    conn.close()
+
+
+# ---------------------------------------------------------------------
+# USERS / AUTH
+# ---------------------------------------------------------------------
+def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE id=?;", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE email=?;", (email,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def has_admin() -> bool:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users WHERE is_admin=1;")
+    result = cur.fetchone()[0]
+    conn.close()
+    return result > 0
+
+
+def create_user(full_name: str, email: str, password: str, is_admin: bool = False) -> Optional[Dict[str, Any]]:
+    """Create new user. Returns user dict or None if email exists.
+       Dual-writes to legacy 'hashed_password' when present (avoids NOT NULL failures)."""
+    if get_user_by_email(email):
+        return None
+    pw_hash = generate_password_hash(password)
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    if _users_has_column("hashed_password"):
+        cur.execute(
+            """
+            INSERT INTO users (full_name, email, password_hash, hashed_password, is_admin)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            (full_name, email, pw_hash, pw_hash, 1 if is_admin else 0),
+        )
+    else:
+        cur.execute(
+            """
+            INSERT INTO users (full_name, email, password_hash, is_admin)
+            VALUES (?, ?, ?, ?);
+            """,
+            (full_name, email, pw_hash, 1 if is_admin else 0),
+        )
 
     conn.commit()
     conn.close()
-
-# ================= Users (get/set) =================
-def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE id=?;", (user_id,))
-    row = cur.fetchone(); conn.close()
-    return dict(row) if row else None
-
-def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
-    email = _norm_email(email)
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE lower(email)=?;", (email,))
-    row = cur.fetchone(); conn.close()
-    return dict(row) if row else None
-
-def set_admin_flag(user_id: int, is_admin: bool) -> None:
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("UPDATE users SET is_admin=? WHERE id=?;", (1 if is_admin else 0, user_id))
-    conn.commit(); conn.close()
-
-def has_admin() -> bool:
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT 1 FROM users WHERE is_admin=1 LIMIT 1;")
-    row = cur.fetchone(); conn.close()
-    return bool(row)
-
-def update_emergency_contact(user_id: int, name: str, email: str, relation: str) -> None:
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET emergency_name=?, emergency_email=?, emergency_relation=? WHERE id=?;",
-        (name, email, relation, user_id),
-    )
-    conn.commit(); conn.close()
-
-# ================= Authentication =================
-def ensure_user_columns():
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("PRAGMA table_info(users);")
-    cols = [r[1] for r in cur.fetchall()]
-    if "password_hash" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN password_hash TEXT;")
-    if "is_admin" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0;")
-    conn.commit(); conn.close()
-
-
-# db.py — replace your current create_user with this version
-def create_user(full_name: str, email: str, password: str, is_admin: bool = False) -> Optional[Dict[str, Any]]:
-    ensure_user_columns()
-    email = _norm_email(email)
-    if not (full_name and email and password):
-        return None
-    if get_user_by_email(email):
-        return None
-
-    # 🚫 If any admin already exists, force new signups to non-admin
-    try:
-        admin_exists = has_admin()
-    except Exception:
-        admin_exists = True  # safest default: don't allow accidental admin creation
-
-    effective_is_admin = (is_admin and not admin_exists)
-
-    pw_hash = generate_password_hash(password)
-    cols = _users_columns()
-
-    insert_cols = ["full_name", "email", "is_admin"]
-    params = [full_name.strip(), email, 1 if effective_is_admin else 0]
-
-    if "password_hash" in cols:
-        insert_cols.append("password_hash")
-        params.append(pw_hash)
-    if "hashed_password" in cols:
-        insert_cols.append("hashed_password")
-        params.append(pw_hash)
-
-    placeholders = ", ".join("?" for _ in insert_cols)
-    sql = f"INSERT INTO users ({', '.join(insert_cols)}) VALUES ({placeholders});"
-
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute(sql, params)
-    conn.commit(); conn.close()
     return get_user_by_email(email)
 
+
 def verify_user(email: str, password: str) -> Optional[Dict[str, Any]]:
-    ensure_user_columns()
-    email = _norm_email(email)
+    """Check password; return user if valid. Falls back to legacy 'hashed_password' if needed."""
     u = get_user_by_email(email)
     if not u:
         return None
-    pw_hash = u.get("password_hash") or u.get("hashed_password") or ""
+
+    pw_hash = (u.get("password_hash") or "").strip()
+
+    # fallback to legacy if needed
+    if not pw_hash and "hashed_password" in u:
+        pw_hash = (u.get("hashed_password") or "").strip()
+
+    if not pw_hash:
+        return None
+
     try:
-        ok = check_password_hash(pw_hash, password or "")
+        ok = check_password_hash(pw_hash, password)
     except Exception:
         ok = False
     return u if ok else None
 
+
 def update_password(user_id: int, new_password: str) -> None:
-    ensure_user_columns()
     pw_hash = generate_password_hash(new_password)
-    cols = _users_columns()
+    conn = get_conn()
+    cur = conn.cursor()
 
-    sets = []
-    params: List[Any] = []
-    if "password_hash" in cols:
-        sets.append("password_hash=?")
-        params.append(pw_hash)
-    if "hashed_password" in cols:
-        sets.append("hashed_password=?")
-        params.append(pw_hash)
-    sets_sql = ", ".join(sets) if sets else "password_hash=?"
-    if not sets:
-        params.append(pw_hash)
+    if _users_has_column("hashed_password"):
+        cur.execute(
+            "UPDATE users SET password_hash=?, hashed_password=? WHERE id=?;",
+            (pw_hash, pw_hash, user_id),
+        )
+    else:
+        cur.execute("UPDATE users SET password_hash=? WHERE id=?;", (pw_hash, user_id))
 
-    params.append(user_id)
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute(f"UPDATE users SET {sets_sql} WHERE id=?;", params)
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
-# ========= Subscription & Billing =========
+
+def update_emergency_contact(user_id: int, name: str, email: str, relation: str) -> None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET emergency_name=?, emergency_email=?, emergency_relation=? WHERE id=?;",
+        (name, email, relation, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_admin_flag(user_id: int, is_admin: bool) -> None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET is_admin=? WHERE id=?;", (1 if is_admin else 0, user_id))
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------
+# DOCUMENTS
+# ---------------------------------------------------------------------
+def insert_document_record(
+    user_id: int,
+    filename_original: str,
+    stored_path: str,
+    file_type: str,
+    category: Optional[str],
+    notes: Optional[str],
+    expiry_date: Optional[str],
+    size_kb: Optional[int],
+    is_generated: bool = False,
+) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO documents
+        (user_id, filename_original, stored_path, file_type, size_kb, category, notes, expiry_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        (user_id, filename_original, stored_path, file_type, size_kb, category, notes, expiry_date),
+    )
+    conn.commit()
+    doc_id = cur.lastrowid
+    conn.close()
+    return doc_id
+
+
+# Backward-compat alias if older pages import insert_document
+insert_document = insert_document_record
+
+
+def get_user_documents(user_id: int, search_text: str = "", category_filter: str = "All") -> List[Dict[str, Any]]:
+    conn = get_conn()
+    cur = conn.cursor()
+    q = """
+        SELECT * FROM documents
+        WHERE user_id=?
+    """
+    params = [user_id]
+    if search_text:
+        q += " AND (filename_original LIKE ? OR notes LIKE ?)"
+        like = f"%{search_text}%"
+        params.extend([like, like])
+    if category_filter and category_filter != "All":
+        q += " AND category=?"
+        params.append(category_filter)
+    q += " ORDER BY uploaded_at DESC;"
+    cur.execute(q, params)
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def count_user_documents(user_id: int) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM documents WHERE user_id=?;", (user_id,))
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
+
+
+def delete_document(user_id: int, doc_id: int) -> bool:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM documents WHERE id=? AND user_id=?;", (doc_id, user_id))
+    conn.commit()
+    ok = cur.rowcount > 0
+    conn.close()
+    return ok
+
+
+# ---------------------------------------------------------------------
+# ACTIVITY LOG
+# ---------------------------------------------------------------------
+def log_activity(user_id: int, action: str, doc_id: Optional[int] = None, details: Optional[str] = None) -> None:
+    ensure_activity_log_columns()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO activity_log (user_id, action, doc_id, details) VALUES (?, ?, ?, ?);",
+        (user_id, action, doc_id, details),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recent_activity(user_id: int) -> List[Dict[str, Any]]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM activity_log WHERE user_id=? ORDER BY id DESC LIMIT 20;",
+        (user_id,),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+# ---------------------------------------------------------------------
+# PAYMENTS (USER SUBMISSION + ADMIN REVIEW)
+# ---------------------------------------------------------------------
+def record_payment_submission(
+    user_id: int,
+    provider: str,
+    currency: str,
+    amount: float,
+    reference: str,
+    raw_json: Optional[str] = None,
+) -> None:
+    """
+    Store a user's payment submission so the admin can review & approve later.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO payments (user_id, provider, currency, amount, reference, raw_json)
+        VALUES (?, ?, ?, ?, ?, ?);
+        """,
+        (user_id, provider, currency, amount, reference, raw_json),
+    )
+    # Mark user as pending
+    cur.execute("UPDATE users SET payment_status=? WHERE id=?;", ("pending", user_id))
+    conn.commit()
+    conn.close()
+
+
+def update_payment_status(user_id: int, status: str) -> None:
+    """
+    Update user's payment_status (e.g., 'pending', 'active', 'expired', 'rejected').
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET payment_status=? WHERE id=?;", (status, user_id))
+    conn.commit()
+    conn.close()
+
+def list_pending_payments() -> List[Dict[str, Any]]:
+    """Admin helper: list latest pending payments with user info + status."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            p.id AS pid,                -- alias for UI keys/buttons
+            p.user_id,
+            p.provider,
+            p.currency,
+            p.amount,
+            p.paid_at,
+            p.reference,
+            p.raw_json,
+            u.full_name,
+            u.email,
+            u.payment_status AS payment_status,
+            u.plan AS user_plan,
+            u.subscription_end AS user_subscription_end
+        FROM payments p
+        JOIN users u ON u.id = p.user_id
+        WHERE u.payment_status = 'pending'
+        ORDER BY p.id DESC;
+        """
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+# Back-compat alias (keep if your Admin Panel imports this name)
+def list_pending_payment_refs() -> List[Dict[str, Any]]:
+    return list_pending_payments()
+
+
+# ---------------------------------------------------------------------
+# SUBSCRIPTIONS
+# ---------------------------------------------------------------------
 def compute_subscription_status(u: Dict[str, Any]) -> str:
     """
-    'active'  : today <= subscription_end
-    'grace'   : subscription_end < today <= subscription_end + GRACE_DAYS
-    'expired' : today > subscription_end + GRACE_DAYS OR missing/invalid
+    Return 'active', 'grace', or 'expired'.
+    - active: today <= subscription_end
+    - grace:  subscription_end < today <= subscription_end + GRACE_DAYS
+    - expired: missing end OR today > end + grace
     """
-    if not u:
-        return "expired"
     end_str = u.get("subscription_end")
     if not end_str:
         return "expired"
@@ -307,8 +509,10 @@ def compute_subscription_status(u: Dict[str, Any]) -> str:
         return "grace"
     return "expired"
 
+
 def subscription_days_left(u: Dict[str, Any]) -> int:
-    if not u or not u.get("subscription_end"):
+    """Days until end date (0 if unknown/invalid; negative inside grace)."""
+    if not u.get("subscription_end"):
         return 0
     try:
         end = dt.date.fromisoformat(u["subscription_end"])
@@ -316,18 +520,17 @@ def subscription_days_left(u: Dict[str, Any]) -> int:
         return 0
     return (end - dt.date.today()).days
 
-def is_subscription_active(u: Dict[str, Any]) -> bool:
-    return compute_subscription_status(u) == "active"
-
-def is_subscription_locked(u: Dict[str, Any]) -> bool:
-    return compute_subscription_status(u) == "expired"
 
 def set_subscription(user_id: int, start: dt.date, end: dt.date, amount: float, currency: str, provider: str) -> None:
-    conn = get_conn(); cur = conn.cursor()
+    """
+    Admin uses this to activate/renew a user's annual plan.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
     cur.execute(
         """
-        UPDATE users SET
-            plan='ANNUAL',
+        UPDATE users
+        SET plan='ANNUAL',
             subscription_start=?,
             subscription_end=?,
             is_premium=1,
@@ -339,175 +542,60 @@ def set_subscription(user_id: int, start: dt.date, end: dt.date, amount: float, 
         """,
         (start.isoformat(), end.isoformat(), amount, currency, provider, user_id),
     )
-    conn.commit(); conn.close()
-
-def update_payment_status(user_id: int, status: str) -> None:
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("UPDATE users SET payment_status=? WHERE id=?;", (status, user_id))
-    conn.commit(); conn.close()
-
-def record_payment_submission(user_id: int, provider: str, currency: str, amount: float, reference: str):
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO payments (user_id, provider, currency, amount, reference, raw_json)
-        VALUES (?, ?, ?, ?, ?, ?);
-        """,
-        (user_id, provider.lower(), currency.upper(), amount, reference.strip(), "submitted_by_user"),
-    )
-    conn.commit(); conn.close()
-
-def list_pending_payment_refs() -> List[Dict[str, Any]]:
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT p.id AS pid, p.user_id, u.full_name, u.email,
-               p.provider, p.currency, p.amount, p.reference, p.paid_at, u.payment_status
-        FROM payments p
-        LEFT JOIN users u ON u.id = p.user_id
-        WHERE COALESCE(u.payment_status,'')='pending'
-        ORDER BY p.id DESC;
-        """
-    )
-    rows = [dict(r) for r in cur.fetchall()]
+    conn.commit()
     conn.close()
-    return rows
 
 
-# --- add these helpers anywhere below your subscription functions ---
-
-def has_active_or_free_quota(u: Dict[str, Any], used_count: int, free_limit: int = 5) -> bool:
-    """
-    Returns True if:
-      - user is FREE and used_count < free_limit, OR
-      - user has an ACTIVE subscription.
-    """
-    plan = (u.get("plan") or "FREE").upper()
-    status = compute_subscription_status(u)
-    if plan == "FREE":
-        return used_count < free_limit
-    return status == "active"
-
+# Legacy convenience for older pages:
 def is_account_locked(u: Dict[str, Any]) -> bool:
-    """
-    Lock the account (no access) ONLY if the user once subscribed (plan != FREE)
-    and the subscription is fully expired (GRACE_DAYS=0).
-    FREE users (never paid) are NOT locked—they can use their 5 free uploads.
-    """
-    plan = (u.get("plan") or "FREE").upper()
-    if plan == "FREE":
-        return False
+    """Locked if subscription fully expired (after grace)."""
     return compute_subscription_status(u) == "expired"
 
+
+# ---------------------------------------------------------------------
+# SUBSCRIPTION REMINDER
+# ---------------------------------------------------------------------
 def needs_renewal_reminder(u: Dict[str, Any]) -> bool:
     """
-    True when user has an active subscription that will end within 7 days.
+    Return True if user's subscription is within 7 days of expiry
+    (or in grace period) and still not renewed.
     """
-    plan = (u.get("plan") or "FREE").upper()
-    if plan == "FREE":
+    end_str = u.get("subscription_end")
+    if not end_str:
         return False
-    days = subscription_days_left(u)
-    return 0 < days <= 7
-
-
-# ================== Documents ===================
-def insert_document(
-    user_id: int,
-    filename_original: str,
-    stored_path: str,
-    file_type: str,
-    size_kb: int,
-    category: Optional[str] = None,
-    notes: Optional[str] = None,
-    expiry_date: Optional[str] = None,
-) -> int:
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO documents
-            (user_id, filename_original, stored_path, file_type, size_kb, category, notes, expiry_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
-        """,
-        (user_id, filename_original, stored_path, file_type, size_kb, category, notes, expiry_date),
-    )
-    doc_id = cur.lastrowid
-    conn.commit(); conn.close()
-    return doc_id
-
-def get_user_documents(user_id: int, search_text: str = "", category_filter: str = "All") -> List[Dict[str, Any]]:
-    conn = get_conn(); cur = conn.cursor()
-    where = ["user_id = ?"]
-    params: List[Any] = [user_id]
-    if search_text:
-        where.append("(lower(filename_original) LIKE ? OR lower(notes) LIKE ?)")
-        like = f"%{search_text.lower()}%"
-        params.extend([like, like])
-    if category_filter and category_filter != "All":
-        where.append("category = ?")
-        params.append(category_filter)
-    sql = f"SELECT * FROM documents WHERE {' AND '.join(where)} ORDER BY uploaded_at DESC;"
-    cur.execute(sql, tuple(params))
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return rows
-
-def count_user_documents(user_id: int) -> int:
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM documents WHERE user_id=?;", (user_id,))
-    row = cur.fetchone(); conn.close()
-    return int(row["c"] if row else 0)
-
-def delete_document(user_id: int, doc_id: int) -> bool:
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT id FROM documents WHERE id=? AND user_id=?;", (doc_id, user_id))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
+    try:
+        end = dt.date.fromisoformat(end_str)
+    except Exception:
         return False
-    cur.execute("DELETE FROM documents WHERE id=?;", (doc_id,))
-    conn.commit(); conn.close()
-    return True
 
-# ================== Activity ====================
+    today = dt.date.today()
+    days_left = (end - today).days
 
-# --- in db.py ---
+    # Show reminder when 0 <= days_left <= 7 or already in grace
+    if 0 <= days_left <= 7:
+        return True
+    if today > end and today <= end + dt.timedelta(days=GRACE_DAYS):
+        return True
 
-def ensure_activity_log_columns():
-    con = get_conn(); cur = con.cursor()
-    cur.execute("PRAGMA table_info(activity_log);")
-    cols = [r[1] for r in cur.fetchall()]
-    if "doc_id" not in cols:
-        cur.execute("ALTER TABLE activity_log ADD COLUMN doc_id INTEGER;")
-    con.commit(); con.close()
+    return False
 
-def log_activity(user_id: int, action: str, doc_id: int | None = None, details: str | None = None) -> None:
-    # auto-heal before inserting
-    ensure_activity_log_columns()
-    con = get_conn(); cur = con.cursor()
-    cur.execute(
-        "INSERT INTO activity_log (user_id, action, doc_id, details) VALUES (?, ?, ?, ?);",
-        (user_id, action, doc_id, details),
-    )
-    con.commit(); con.close()
 
-def get_recent_activity(user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute(
-        "SELECT * FROM activity_log WHERE user_id=? ORDER BY timestamp DESC LIMIT ?;",
-        (user_id, limit),
-    )
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return rows
-
-# ================= Admin listings ===============
+# ---------------------------------------------------------------------
+# ADMIN USER MANAGEMENT
+# ---------------------------------------------------------------------
 def list_users(search: str = "") -> List[Dict[str, Any]]:
-    conn = get_conn(); cur = conn.cursor()
+    """
+    Return all users, optionally filtered by name or email.
+    Used in Admin Panel to display users and manage privileges.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
     if search:
         like = f"%{search.lower()}%"
         cur.execute(
             """
-            SELECT * FROM users
+            SELECT *
+            FROM users
             WHERE lower(full_name) LIKE ? OR lower(email) LIKE ?
             ORDER BY id DESC;
             """,
@@ -515,6 +603,13 @@ def list_users(search: str = "") -> List[Dict[str, Any]]:
         )
     else:
         cur.execute("SELECT * FROM users ORDER BY id DESC;")
+
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     return rows
+
+
+# ---------------------------------------------------------------------
+# AUTO-INIT ON IMPORT
+# ---------------------------------------------------------------------
+init_db()
