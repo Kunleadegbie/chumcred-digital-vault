@@ -107,7 +107,7 @@ def main():
     st.header("11. Contact")
     st.write(
         "Chumcred Limited  \n"
-        "Support: support@chumcred.com"
+        "Support: chumcred@gmail.com"
     )
 
     st.write("---")
