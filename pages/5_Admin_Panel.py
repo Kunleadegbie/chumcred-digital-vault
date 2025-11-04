@@ -11,19 +11,45 @@ import streamlit as st
 from auth import get_current_user
 from db import (
     list_users,
-    set_admin_flag,
-    list_pending_payment_refs,  # alias points to list_pending_payments()
+    # set_admin_flag,                 # ❌ Not used with env-driven admin
+    list_pending_payment_refs,        # alias points to list_pending_payments()
     set_subscription,
     update_payment_status,
 )
 
-# ----------------------------- Guards -----------------------------
-def guard_admin():
+# ──────────────────────────────────────────────────────────────────────────────
+# Admin via ENV — single source of truth
+#   Set in Railway → Variables:
+#     ADMIN_EMAIL=you@chumcred.com
+#     or
+#     ADMIN_EMAILS=you@chumcred.com,cofounder@chumcred.com
+# ──────────────────────────────────────────────────────────────────────────────
+def _load_admin_emails_from_env() -> set:
+    many = os.getenv("ADMIN_EMAILS", "")
+    single = os.getenv("ADMIN_EMAIL", "")
+    raw = many if many.strip() else single
+    emails = [e.strip().lower() for e in raw.split(",") if e.strip()]
+    return set(emails)
+
+ADMIN_EMAILS = _load_admin_emails_from_env()
+
+def is_admin_email(email: str | None) -> bool:
+    return bool(email and email.strip().lower() in ADMIN_EMAILS)
+
+def is_current_admin() -> bool:
+    """
+    Primary: trust session flag set in app.py (Option A).
+    Fallback: compute from the current user's email against ENV.
+    """
+    if st.session_state.get("is_admin") is True:
+        return True
     u = get_current_user()
-    if not u or not u.get("is_admin"):
+    return is_admin_email((u or {}).get("email"))
+
+def require_admin():
+    if not is_current_admin():
         st.error("Access denied. Admins only.")
         st.stop()
-    return u
 
 # ------------------------- Users management ------------------------
 def section_users():
@@ -38,24 +64,20 @@ def section_users():
         full_name = r.get("full_name", "—")
         email = r.get("email", "—")
         with st.expander(f"{full_name} • {email}"):
+            # Show plan & status
             st.write(f"Plan: {r.get('plan') or 'FREE'}")
             st.write(f"Subscription end: {r.get('subscription_end') or '—'}")
             st.write(f"Payment status: {r.get('payment_status') or '—'}")
 
-            c1, c2 = st.columns(2)
-            with c1:
-                st.write(f"Admin: {'✅' if r.get('is_admin') else '❌'}")
-                if not r.get("is_admin"):
-                    if st.button("Make Admin", key=f"mkadm_{r.get('id')}"):
-                        set_admin_flag(r["id"], True)
-                        st.success(f"{email} is now an admin.")
-                        st.rerun()
-            with c2:
-                if r.get("is_admin"):
-                    if st.button("Remove Admin", key=f"rmadm_{r.get('id')}"):
-                        set_admin_flag(r["id"], False)
-                        st.success(f"Admin rights removed for {email}.")
-                        st.rerun()
+            # Admin display is ENV-based (source of truth)
+            env_is_admin = is_admin_email(email)
+            st.write(f"Admin (env): {'✅' if env_is_admin else '❌'}")
+
+            # Explain why toggles are gone
+            st.info(
+                "Admin rights are controlled by platform-owner email(s) set in environment variables "
+                "(ADMIN_EMAIL or ADMIN_EMAILS). To change admins, update Railway → Variables."
+            )
 
 # ---------------------- Pending payment approvals -------------------
 def section_pending_approvals():
@@ -129,7 +151,7 @@ def section_pending_approvals():
 
 # ------------------------------ Main -------------------------------
 def main():
-    guard_admin()
+    require_admin()
     st.title("Admin Panel 🛡️")
 
     tab1, tab2 = st.tabs(["Pending Approvals", "Users"])

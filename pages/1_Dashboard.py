@@ -3,6 +3,7 @@
 """
 Chumcred Vault — Dashboard
 Shows plan status, documents list (download/delete), and recent activity.
+Admin is recognized via ENV (ADMIN_EMAIL or ADMIN_EMAILS) — no self-elevation.
 """
 
 import os
@@ -21,7 +22,37 @@ from db import (
 
 FREE_LIMIT = 5
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Admin via ENV — single source of truth (Option A)
+#   Set in Railway → Variables:
+#     ADMIN_EMAIL=you@chumcred.com
+#     or
+#     ADMIN_EMAILS=you@chumcred.com,cofounder@chumcred.com
+# ──────────────────────────────────────────────────────────────────────────────
+def _load_admin_emails_from_env() -> set:
+    many = os.getenv("ADMIN_EMAILS", "")
+    single = os.getenv("ADMIN_EMAIL", "")
+    raw = many if many.strip() else single
+    emails = [e.strip().lower() for e in raw.split(",") if e.strip()]
+    return set(emails)
 
+ADMIN_EMAILS = _load_admin_emails_from_env()
+
+def is_admin_email(email: str | None) -> bool:
+    return bool(email and email.strip().lower() in ADMIN_EMAILS)
+
+def is_current_admin() -> bool:
+    """
+    Prefer the session flag set at login (from app.py). Fallback to ENV check.
+    """
+    if st.session_state.get("is_admin") is True:
+        return True
+    u = get_current_user()
+    return is_admin_email((u or {}).get("email"))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# UI helpers
+# ──────────────────────────────────────────────────────────────────────────────
 def show_plan_status(user: dict, used_count: int) -> None:
     """
     Render plan/usage status and guard expired accounts.
@@ -36,25 +67,29 @@ def show_plan_status(user: dict, used_count: int) -> None:
     col1, col2 = st.columns([3, 1])
     with col1:
         if plan == "FREE":
-            st.info(f"🔓 Free Plan — {used_count}/{FREE_LIMIT} documents used. "
-                    f"Upload up to {FREE_LIMIT} docs for free. "
-                    "Upgrade to continue after the limit.")
+            st.info(
+                f"🔓 Free Plan — {used_count}/{FREE_LIMIT} documents used. "
+                f"Upload up to {FREE_LIMIT} docs for free. "
+                "Upgrade to continue after the limit."
+            )
         else:
             if status == "active":
                 days = max(subscription_days_left(user), 0)
-                st.success(f"✅ Annual Plan — Active. Unlimited uploads enabled. "
-                           f"{days} day(s) left in this cycle.")
+                st.success(
+                    f"✅ Annual Plan — Active. Unlimited uploads enabled. "
+                    f"{days} day(s) left in this cycle."
+                )
             elif status == "grace":
                 days = max(subscription_days_left(user), 0)
-                # days will be negative or small if you consider grace; keep a friendly message:
                 st.warning("⚠️ Annual Plan — Grace period. Please renew soon to avoid lockout.")
             else:
-                st.error("⛔ Your subscription has expired. Access is locked until an admin confirms renewal payment. "
-                         "Go to **Settings → Upgrade / Renewal** to submit a payment reference.")
+                st.error(
+                    "⛔ Your subscription has expired. Access is locked until an admin confirms renewal payment. "
+                    "Go to **Settings → Upgrade / Renewal** to submit a payment reference."
+                )
                 st.stop()  # hard lock for subscribed-but-expired users
     with col2:
         st.metric("Total Docs", used_count)
-
 
 def show_document_table(user_id: int, docs: list) -> None:
     st.subheader("Your Documents")
@@ -85,6 +120,7 @@ def show_document_table(user_id: int, docs: list) -> None:
 
             with c3:
                 stored_path = doc.get("stored_path")
+
                 # Download (only if file is present on disk)
                 if stored_path and os.path.exists(stored_path):
                     try:
@@ -100,7 +136,7 @@ def show_document_table(user_id: int, docs: list) -> None:
                 else:
                     st.caption("File not present on this server.")
 
-                # Delete
+                # Delete (user can delete their own doc; admin also allowed if needed)
                 if st.button("Delete", key=f"del_{doc['id']}"):
                     ok = delete_document(user_id, doc["id"])
                     if ok:
@@ -114,7 +150,6 @@ def show_document_table(user_id: int, docs: list) -> None:
                     else:
                         st.error("Delete failed (not allowed or missing).")
 
-
 def show_activity(user_id: int) -> None:
     st.subheader("Recent Activity")
     events = get_recent_activity(user_id)
@@ -127,7 +162,9 @@ def show_activity(user_id: int) -> None:
         details = e.get("details") or ""
         st.write(f"- {when}: **{action}** {details}")
 
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
 def main() -> None:
     user = get_current_user()
     if not user:
@@ -170,9 +207,12 @@ def main() -> None:
     st.divider()
     show_activity(user["id"])
 
+    # Optional: show a tiny admin badge if the current user is an admin (based on ENV)
+    if is_current_admin():
+        st.caption("🛡️ Admin recognized (env).")
+
     st.write("---")
     st.caption("Powered by Chumcred Limited")
-
 
 if __name__ == "__main__":
     main()
