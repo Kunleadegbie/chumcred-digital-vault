@@ -20,9 +20,9 @@ from db import (
 # ──────────────────────────────────────────────────────────────────────────────
 # Admin via ENV — single source of truth
 #   Set in Railway → Variables:
-#     ADMIN_EMAIL=you@chumcred.com
+#     ADMIN_EMAIL=chumcred@gmail.com
 #     or
-#     ADMIN_EMAILS=you@chumcred.com,cofounder@chumcred.com
+#     ADMIN_EMAILS=kuedimfi@gmail.com,adekadegbie@gmail.com
 # ──────────────────────────────────────────────────────────────────────────────
 def _load_admin_emails_from_env() -> set:
     many = os.getenv("ADMIN_EMAILS", "")
