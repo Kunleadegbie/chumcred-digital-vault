@@ -3,6 +3,19 @@ import os
 import inspect
 import streamlit as st
 
+
+# ✅ This must be first Streamlit command
+st.set_page_config(
+    page_title="Chumcred Digital Vault",
+    page_icon="logo.png",   # or "🔐"
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Now safe to use other Streamlit functions
+st.image("logo.png", width=240)
+
+
 from db import (
     init_db,
     verify_user,
@@ -12,8 +25,6 @@ from db import (
     has_admin,
 )
 
-# ---------- Page config ----------
-st.set_page_config(page_title="Chumcred Vault", page_icon="🔐", layout="wide")
 
 # ---------- Init DB once ----------
 @st.cache_resource(show_spinner=False)
